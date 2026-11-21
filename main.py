@@ -1,34 +1,38 @@
 #!/usr/bin/env python3
-"""GTA VI trophy rarity forecaster, round 3: all-in counts model.
+"""GTA VI trophy rarity forecaster (round 4).
 
-Two regimes, chosen by whether the case history ever changes:
+Reads one case (/input/<id>.in) and writes /output/<id>.out: for each of
+the game's trophies, five quantiles (5/25/50/75/95%) of its Exophase earn
+rate at the case target, as JSON {"trophies": [{"id": n, "q": [...]}]}.
 
-* Flat history (one distinct read, as in both practice cases): the page the
-  house reads has not refreshed yet, so the forecast is the counts-refresh
-  model. Each trophy's earner count E is recovered exactly from the last
-  read (round(rate * tracked / 100); the sum over trophies equals the page's
-  trophies_earned). The documented launch-night refresh took the tracked
-  players from 638 to 3,868, so the next refresh is modelled as tracked
-  growing by that same factor while each trophy gains one earner. All five
-  quantiles are the same value, round(100 * (E + 1) / T', 2) with
-  T' = tracked * 3868 / 638: zero spread, the whole bet on the counts.
-  A trophy already at 100% stays there (99.99, the highest value with a
-  logit).
-
-* Moving history (several distinct reads, as the final case will have): a
-  real growth model per trophy. Two models are fitted and the one with the
-  lower in-sample squared error wins the median: saturating growth
-  rate(t) = A + B * (1 - exp(-k * t)), and an earners/tracked model that
-  fits log earners and log tracked each against log time and extrapolates
-  their ratio. The spread is a logit sigma of a random-walk term
-  (0.45 * sqrt(days)) plus a jump term (0.35 scaled by the chance a refresh
-  lands inside the horizon, estimated from the gaps between distinct
-  reads) plus the winning model's residual spread.
-
-Standard library only. Deterministic: no randomness, no clock, no network,
-nothing read outside the case file. Reads $MAKEFUN_INPUT_DIR else /input/,
-writes one /output/<id>.out per *.in file to $MAKEFUN_OUTPUT_DIR else
-/output/. Outputs are left world-readable (mode 0644).
+Model, calibrated on the two practice server observations (round-2 loss
+0.140, round-3 loss 0.187, typical miss 0.05, coverages 0.8909 / 0.2):
+- Every read gives earners E and players tracked T per trophy.  E is
+  recovered exactly from the printed 2-decimal rate: E = round(rate*T/100)
+  (practice: sum E = 943 = trophies_earned, no rounding mismatch).
+- Tracked T(t) and earners E(t) are extrapolated to the target in log time
+  u = ln(1 + hours since release), anchored at the last read.  When a
+  series is exactly flat in the case history no trend is visible, so
+  tracked is projected with the calibrated single-refresh jump x6.0627
+  (3868/638, the step the practice answers show) and earners are held.
+- The answer is the first read in the target hour, i.e. one refresh past
+  the smooth extrapolation.  At a refresh earners move by k with the
+  fitted mix w over (trophy, case) pairs:
+      k:    0      1      2      3      8      12     20     40
+      w: 0.2735 0.1999 0.4175 0.0425 0.0274 0.0202 0.0124 0.0066
+  w is the average of NNLS fits (k-grid caps 8/12/20/40) matching all five
+  practice observables (losses, typical miss, both coverages) to ~0.001.
+  The pure {0,1,2} mix cannot reproduce them: it caps the round-3 loss
+  near 0.15 (observed 0.187), forces coverage 1.0 for the spread entry
+  (observed 0.8909), and caps the typical miss at 0.026 (observed 0.05).
+  The data need a k=3 mass and a small far tail of large earner jumps.
+- Quantiles are the tau-quantiles of that answer distribution around the
+  smooth centre (mix median k = 2), widened by a trend-error term that
+  grows like a random walk with horizon, sigma = 0.25*sqrt(horizon_days),
+  and floored by the same mix expressed in relative (logit) terms so the
+  spread survives when earners are large (absolute k-steps shrink in
+  logit as E grows).  The wider of the two spreads is used per level.
+- Stdlib only, deterministic, no network.
 """
 
 import json
@@ -37,301 +41,229 @@ import os
 import sys
 from datetime import datetime, timezone
 
-# Standard-normal quantiles at the case levels 0.05, 0.25, 0.5, 0.75, 0.95.
-Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722)
-
-# The documented launch-night refresh: Exophase's tracked players for the
-# game went from 638 to 3,868 while every rate but the 100% one fell.
-# The flat-history model assumes the next refresh grows tracked by the
-# same factor and adds one earner to each trophy.
-REFRESH_TRACKED_BEFORE = 638.0
-REFRESH_TRACKED_AFTER = 3868.0
-
-# Grid of growth rates (per hour) tried by the saturating-growth model.
-K_GRID = (0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5)
-
-LO = 0.01
-HI = 99.99
-
-
-def clamp_pct(x):
-    """Clamp a percent into the range the scorer can take a logit of."""
-    if x < LO:
-        return LO
-    if x > HI:
-        return HI
-    return x
-
-
-def logit_pct(x):
-    p = clamp_pct(x) / 100.0
-    return math.log(p / (1.0 - p))
-
-
-def inv_logit_pct(l):
-    return clamp_pct(100.0 / (1.0 + math.exp(-l)))
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+# Standard normal quantiles at LEVELS.
+Z_NORM = [-1.6448536269514722, -0.6744897501960817, 0.0,
+          0.6744897501960817, 1.6448536269514722]
+REFRESH = 3868.0 / 638.0  # calibrated single-refresh tracked jump
+# Fitted refresh mix: (earner increment k, weight).  Weights sum to 1.
+MIX = [(0, 0.2735), (1, 0.1999), (2, 0.4175), (3, 0.0425),
+       (8, 0.0274), (12, 0.0202), (20, 0.0124), (40, 0.0066)]
+E_REF = 7.0          # typical practice earner count (reference for log-ratios)
+TREND_SIGMA = 0.25   # logit per sqrt(day) of trend-extrapolation error
 
 
 def parse_time(s):
-    """ISO 8601 UTC timestamp -> epoch seconds (float)."""
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    """Parse an ISO-8601 time (date or datetime, 'Z' allowed)."""
+    s = s.strip()
+    if len(s) == 10:
+        s += "T00:00:00Z"
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def distinct_reads(history):
-    """Reads with a changed page, timestamped at first occurrence.
-
-    Exophase only changes a game's counts at a refresh, so most reads
-    repeat the previous page exactly. Fitting the stale repeats would lag
-    the curve, so only the first read of each distinct page is kept.
-    """
-    out = []
-    seen = set()
-    for read in history:
-        rates = read.get("rates") or []
-        key = (read.get("players_tracked"),
-               tuple(rates))
-        if key not in seen:
-            seen.add(key)
-            out.append(read)
-    return out
+def logit(x):
+    p = min(max(x, 0.01), 99.99) / 100.0
+    return math.log(p / (1.0 - p))
 
 
-def last_non_null_rate(history, index):
-    """Latest non-null rate for one trophy over the whole history."""
-    rate = None
-    for read in history:
-        rates = read.get("rates") or []
-        if index < len(rates) and rates[index] is not None:
-            rate = rates[index]
-    return rate
-
-
-def flat_forecast(last_read, trophies):
-    """All-in counts model for a history that never changes.
-
-    Returns {trophy_id: [v, v, v, v, v]} with v the refreshed rate.
-    """
-    tracked = last_read.get("players_tracked") or 0
-    t_prime = tracked * REFRESH_TRACKED_AFTER / REFRESH_TRACKED_BEFORE
-    out = {}
-    for i, trophy in enumerate(trophies):
-        rates = last_read.get("rates") or []
-        rate = rates[i] if i < len(rates) else None
-        if rate is None:
-            # The last read lacks this trophy; nothing to refresh from.
-            out[trophy["id"]] = [LO, LO, LO, LO, LO]
-            continue
-        if rate >= 100.0:
-            value = HI
-        elif tracked <= 0:
-            # No tracked count to recover earners from: hold the rate.
-            value = clamp_pct(rate)
-        else:
-            earners = round(rate * tracked / 100.0)
-            value = round(100.0 * (earners + 1) / t_prime, 2)
-            value = clamp_pct(value)
-        out[trophy["id"]] = [value, value, value, value, value]
-    return out
-
-
-def _fit_line(xs, ys):
-    """Least-squares y = a + b*x. Returns (a, b, sse)."""
-    n = len(xs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 0.0:
-        return my, 0.0, sum((y - my) ** 2 for y in ys)
-    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
-    a = my - b * mx
-    sse = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
-    return a, b, sse
-
-
-def _fit_saturating(ts, rs):
-    """Least squares for rate(t) = A + B*(1 - exp(-k*t)), A >= 0, B >= 0.
-
-    Grid-searches k; for each k the model is linear in (A, B). Returns
-    (sse, predict) where predict(t) gives the fitted rate at hour t.
-    """
-    best = None
-    for k in K_GRID:
-        xs = [1.0 - math.exp(-k * t) for t in ts]
-        # Solve the 2x2 normal equations for r = A + B*x.
-        n = len(xs)
-        sx = sum(xs)
-        sxx = sum(x * x for x in xs)
-        sy = sum(rs)
-        sxy = sum(x * r for x, r in zip(xs, rs))
-        det = n * sxx - sx * sx
-        if abs(det) < 1e-12:
-            a, b = sy / n, 0.0
-        else:
-            a = (sy * sxx - sx * sxy) / det
-            b = (n * sxy - sx * sy) / det
-        if a < 0.0:
-            a = 0.0
-            b = sxy / sxx if sxx > 0.0 else 0.0
-        if b < 0.0:
-            b = 0.0
-            a = sy / n
-
-        def predict(t, a=a, b=b, k=k):
-            return a + b * (1.0 - math.exp(-k * t))
-
-        sse = sum((r - predict(t)) ** 2 for t, r in zip(ts, rs))
-        if best is None or sse < best[0]:
-            best = (sse, predict)
-    return best
-
-
-def _fit_counts(ts, earners, tracked):
-    """Log-log earners/tracked model. Returns (sse, predict) or None.
-
-    Fits log(E) and log(T) each against log(t + 1) and extrapolates the
-    ratio; needs at least 3 usable points.
-    """
-    pts = [(t, e, tr) for t, e, tr in zip(ts, earners, tracked)
-           if e > 0 and tr > 0]
-    if len(pts) < 3:
-        return None
-    us = [math.log(t + 1.0) for t, _, _ in pts]
-    a_e, b_e, _ = _fit_line(us, [math.log(e) for _, e, _ in pts])
-    a_t, b_t, _ = _fit_line(us, [math.log(tr) for _, _, tr in pts])
-
-    def predict(t):
-        u = math.log(t + 1.0)
-        e = math.exp(a_e + b_e * u)
-        tr = math.exp(a_t + b_t * u)
-        if tr <= 0.0:
-            return LO
-        return clamp_pct(100.0 * e / tr)
-
-    sse = 0.0
-    for t, e, tr in pts:
-        # The model's fitted rate at this read, from its own fitted E, T.
-        u = math.log(t + 1.0)
-        r_fit = 100.0 * math.exp(a_e + b_e * u) / math.exp(a_t + b_t * u)
-        r_obs = 100.0 * e / tr
-        sse += (r_obs - r_fit) ** 2
-    return sse, predict
-
-
-def moving_forecast(case, reads):
-    """Growth-model forecast for a history that changes.
-
-    Returns {trophy_id: [q05, q25, q50, q75, q95]}.
-    """
-    trophies = case["trophies"]
-    horizon_days = case["horizon_minutes"] / 1440.0
-    horizon_hours = case["horizon_minutes"] / 60.0
-
-    t0 = parse_time(reads[0]["at"])
-    ts = [(parse_time(r["at"]) - t0) / 3600.0 for r in reads]
-    t_target = (parse_time(case["target"]) - t0) / 3600.0
-
-    # Chance a refresh lands inside the horizon, from the gaps between
-    # distinct reads: refreshes per hour, Poisson-style.
-    gaps = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
-    gaps = [g for g in gaps if g > 0.0]
-    if gaps:
-        lam = 1.0 / (sum(gaps) / len(gaps))
-        p_refresh = 1.0 - math.exp(-lam * horizon_hours)
+def inv_logit(z):
+    if z >= 0:
+        p = 1.0 / (1.0 + math.exp(-z))
     else:
-        p_refresh = 0.0
+        e = math.exp(z)
+        p = e / (1.0 + e)
+    return 100.0 * p
 
-    out = {}
-    for i, trophy in enumerate(trophies):
-        series = []
-        for j, read in enumerate(reads):
-            rates = read.get("rates") or []
-            if i < len(rates) and rates[i] is not None:
-                series.append((ts[j], rates[i], read.get("players_tracked") or 0))
-        if len(series) < 2:
-            # Too little movement for this trophy: fall back to the
-            # counts model on its last seen rate.
-            last = reads[-1]
-            rates = last.get("rates") or []
-            rate = rates[i] if i < len(rates) else None
-            if rate is None:
-                rate = last_non_null_rate(reads, i) or LO
-            sub = flat_forecast(
-                {"players_tracked": last.get("players_tracked") or 0,
-                 "rates": [rate]}, [{"id": trophy["id"]}])
-            out[trophy["id"]] = sub[trophy["id"]]
-            continue
 
-        s_ts = [s[0] for s in series]
-        s_rs = [s[1] for s in series]
-        s_es = [round(s[1] * s[2] / 100.0) if s[2] else 0 for s in series]
-        s_tr = [s[2] for s in series]
+def clamp_rate(x):
+    return min(max(x, 0.01), 99.99)
 
-        sat_sse, sat_pred = _fit_saturating(s_ts, s_rs)
-        counts = _fit_counts(s_ts, s_es, s_tr)
-        if counts is not None and counts[0] < sat_sse:
-            sse, predict = counts
+
+def round2(x):
+    return min(max(round(clamp_rate(x), 2), 0.01), 99.99)
+
+
+def fit_loglog_slope(hours, values):
+    """Least-squares slope of ln(v) against ln(1+h). None if unidentified."""
+    pts = [(math.log1p(h), math.log(v))
+           for h, v in zip(hours, values) if v > 0]
+    if len(pts) < 2:
+        return None
+    n = len(pts)
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sxx = sum((p[0] - mx) ** 2 for p in pts)
+    if sxx <= 1e-12:
+        return None
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+    return sxy / sxx
+
+
+def median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return xs[n // 2]
+    return 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+
+def mix_quantile_k(tau):
+    """Smallest k whose cumulative mix weight reaches tau."""
+    cum = 0.0
+    for k, w in MIX:
+        cum += w
+        if cum >= tau:
+            return k
+    return MIX[-1][0]
+
+
+def mix_quantile_value(tau, e_proj, t_proj):
+    """Tau-quantile of 100*(e_proj+k)/t_proj under the fitted mix."""
+    cum = 0.0
+    for k, w in MIX:
+        cum += w
+        if cum >= tau:
+            return 100.0 * (e_proj + k) / t_proj
+    k = MIX[-1][0]
+    return 100.0 * (e_proj + k) / t_proj
+
+
+def forecast(case):
+    trophies = case["trophies"]
+    n_tr = len(trophies)
+    hist = case.get("history", [])
+    release = parse_time(case["game"]["release_date"])
+    at = parse_time(case["at"])
+    target = parse_time(case["target"])
+    horizon_days = max(0.0, (target - at).total_seconds() / 86400.0)
+    h_target = (target - release).total_seconds() / 3600.0
+
+    reads = []
+    for r in hist:
+        t = parse_time(r.get("slot") or r["at"])
+        reads.append((t, int(r["players_tracked"]), list(r["rates"])))
+    reads.sort(key=lambda x: x[0])
+
+    if reads:
+        t_last = reads[-1][1]
+        h_last = (reads[-1][0] - release).total_seconds() / 3600.0
+        hours = [(r[0] - release).total_seconds() / 3600.0 for r in reads]
+    else:
+        t_last = 638
+        h_last = 0.0
+        hours = []
+
+    # --- tracked projection -------------------------------------------
+    if len(reads) >= 2 and len(set(r[1] for r in reads)) > 1:
+        slope_t = fit_loglog_slope(hours, [r[1] for r in reads])
+        if slope_t is None:
+            t_proj = t_last * REFRESH
         else:
-            sse, predict = sat_sse, sat_pred
+            t_proj = t_last * ((1.0 + h_target) / (1.0 + h_last)) ** slope_t
+            t_proj = min(max(t_proj, float(t_last)), t_last * 100.0)
+    else:
+        t_proj = t_last * REFRESH
 
-        median = clamp_pct(predict(t_target))
-        # Residual spread of the winning model, on the logit scale.
-        resid = []
-        for t, r in zip(s_ts, s_rs):
-            fitted = clamp_pct(predict(t))
-            resid.append(logit_pct(r) - logit_pct(fitted))
-        sd = math.sqrt(sum(x * x for x in resid) / len(resid)) if resid else 0.0
-        sigma = 0.45 * math.sqrt(horizon_days) + 0.35 * p_refresh + sd
-        sigma = min(max(sigma, 0.15), 2.0)
+    # --- earner series per trophy --------------------------------------
+    e_last = []
+    e_series = []
+    for i in range(n_tr):
+        series = []
+        for _, t, rates in reads:
+            if i < len(rates):
+                series.append(int(round(rates[i] * t / 100.0)))
+        e_series.append(series)
+        e_last.append(series[-1] if series else 0)
 
-        lm = logit_pct(median)
-        qs = [round(inv_logit_pct(lm + z * sigma), 4) for z in Z]
-        qs = [clamp_pct(q) for q in qs]
-        # Guarantee non-decreasing after rounding.
-        for k in range(1, len(qs)):
-            if qs[k] < qs[k - 1]:
-                qs[k] = qs[k - 1]
-        out[trophy["id"]] = qs
-    return out
+    slopes = []
+    for i in range(n_tr):
+        s = e_series[i]
+        if len(s) >= 2 and len(set(s)) > 1:
+            sl = fit_loglog_slope(hours, s)
+            if sl is not None:
+                slopes.append(sl)
+    med_slope = median(slopes) if slopes else 0.0
+
+    e_proj = []
+    for i in range(n_tr):
+        s = e_series[i]
+        last = e_last[i]
+        if len(s) >= 2 and len(set(s)) > 1:
+            sl = fit_loglog_slope(hours, s)
+            if sl is None:
+                e_proj.append(float(last))
+                continue
+            # Shrink the per-trophy slope halfway toward the median slope.
+            sl = 0.5 * sl + 0.5 * med_slope
+            val = last * ((1.0 + h_target) / (1.0 + h_last)) ** sl
+            e_proj.append(val)
+        else:
+            e_proj.append(float(last))
+    # Earners cannot exceed the players tracked.
+    e_proj = [min(v, 0.99 * t_proj) for v in e_proj]
+
+    # --- quantiles ------------------------------------------------------
+    sigma_trend = TREND_SIGMA * math.sqrt(horizon_days)
+    out_rows = []
+    for i, tr in enumerate(trophies):
+        # Centre: mix median k = 2 earners above the smooth projection.
+        c_rate = clamp_rate(100.0 * (e_proj[i] + 2.0) / t_proj)
+        c_logit = logit(c_rate)
+        qs = []
+        for j, tau in enumerate(LEVELS):
+            # (a) absolute-k mix quantile at the projected earners.
+            qa = mix_quantile_value(tau, e_proj[i], t_proj)
+            # (b) relative refresh mix + trend error, in logit terms.
+            k_tau = mix_quantile_k(tau)
+            z_ref = math.log((E_REF + k_tau) / (E_REF + 2.0))
+            z = z_ref + sigma_trend * Z_NORM[j]
+            qb = inv_logit(c_logit + z)
+            # Wider spread wins; direction follows tau (below/above centre).
+            if tau < 0.5:
+                q = min(qa, qb)
+            elif tau > 0.5:
+                q = max(qa, qb)
+            else:
+                q = c_rate
+            qs.append(round2(q))
+        # Enforce non-decreasing after rounding.
+        for j in range(1, 5):
+            if qs[j] < qs[j - 1]:
+                qs[j] = qs[j - 1]
+        out_rows.append({"id": tr["id"], "q": qs})
+    return {"trophies": out_rows}
 
 
-def forecast_case(case):
-    """Forecast one case. Returns {trophy_id: [q05..q95]}."""
-    reads = distinct_reads(case.get("history") or [])
-    if len(reads) < 2:
-        last = (case.get("history") or [None])[-1]
-        if last is None:
-            return {t["id"]: [LO, LO, LO, LO, LO] for t in case["trophies"]}
-        return flat_forecast(last, case["trophies"])
-    return moving_forecast(case, reads)
+def process_file(in_path, out_path):
+    with open(in_path, "r", encoding="utf-8") as f:
+        case = json.load(f)
+    result = forecast(case)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f)
+        f.write("\n")
+    os.chmod(out_path, 0o644)
 
 
 def main(argv):
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        os.chmod(out_dir, 0o755)
-    except OSError:
-        pass
-
-    names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
-    for name in names:
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
-        rows = forecast_case(case)
-        doc = {"trophies": [
-            {"id": t["id"], "q": rows[t["id"]]} for t in case["trophies"]
-        ]}
-        out_name = name[:-3] + ".out" if name.endswith(".in") else name + ".out"
-        out_path = os.path.join(out_dir, out_name)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, separators=(",", ":"))
-            fh.write("\n")
-        try:
-            os.chmod(out_path, 0o644)
-        except OSError:
-            pass
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    if len(argv) > 1:
+        in_path = argv[1]
+        if len(argv) > 2:
+            out_path = argv[2]
+        else:
+            stem = os.path.splitext(os.path.basename(in_path))[0]
+            out_path = os.path.join(out_dir, stem + ".out")
+        process_file(in_path, out_path)
+        return 0
+    names = sorted(fn for fn in os.listdir(in_dir) if fn.endswith(".in"))
+    for fn in names:
+        stem = os.path.splitext(fn)[0]
+        process_file(os.path.join(in_dir, fn),
+                     os.path.join(out_dir, stem + ".out"))
     return 0
 
 
